@@ -1,0 +1,350 @@
+/******************************************************************************
+* 这是STM32的RTC模块演示程序
+*******************************************************************************/
+
+/* Includes ------------------------------------------------------------------*/
+#include "stm32f10x_lib.h"
+
+#include <stdio.h>
+
+/* Private typedef -----------------------------------------------------------*/
+/* Private define ------------------------------------------------------------*/
+#define RTCClockOutput_Enable  /* RTC Clock/64 is output on tamper pin(PC.13) */
+
+/* Private macro -------------------------------------------------------------*/
+/* Private variables ---------------------------------------------------------*/
+u32 current_time;
+
+/* Private function prototypes -----------------------------------------------*/
+void RCC_Configuration(void);
+void GPIO_Configuration(void);
+void USART_Configuration(void);
+void RTC_Configuration(void);
+void NVIC_Configuration(void);
+
+void Time_Set(u32 t);
+                                          
+/* Private functions ---------------------------------------------------------*/
+/*******************************************************************************
+* Function Name  : main
+* Description    : Main program.
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+int main(void)
+{
+
+
+    RCC_Configuration();
+    NVIC_Configuration();
+    GPIO_Configuration();
+    USART_Configuration();
+    
+    //我们在BKP的后备寄存器1中，存了一个特殊字符0xA5A5
+    //第一次上电或后备电源掉电后，该寄存器数据丢失，
+    //表明RTC数据丢失，需要重新配置
+    if (BKP_ReadBackupRegister(BKP_DR1) != 0xA5A5)
+    {
+        printf("\r\n\n RTC not yet configured...."); 
+        //重新配置RTC
+        RTC_Configuration();
+        printf("\r\n RTC configured....");
+        //配置完成后，向后备寄存器中写特殊字符0xA5A5
+        BKP_WriteBackupRegister(BKP_DR1, 0xA5A5);
+    }
+    else
+    {
+        //若后备寄存器没有掉电，则无需重新配置RTC
+        //这里我们可以利用RCC_GetFlagStatus()函数查看本次复位类型
+        if (RCC_GetFlagStatus(RCC_FLAG_PORRST) != RESET)
+        {
+            //这是上电复位
+            printf("\r\n\n Power On Reset occurred....");
+        }
+        else if (RCC_GetFlagStatus(RCC_FLAG_PINRST) != RESET)
+        {
+            //这是外部RST管脚复位
+            printf("\r\n\n External Reset occurred....");
+        }
+        //清除RCC中复位标志
+        RCC_ClearFlag();
+        
+	    printf("\r\n No need to configure RTC....");
+	    
+	    //虽然RTC模块不需要重新配置，且掉电后依靠后备电池依然运行
+	    //但是每次上电后，还是要使能RTCCLK???????
+	    RCC_RTCCLKCmd(ENABLE);
+        //等待RTC时钟与APB1时钟同步
+	    RTC_WaitForSynchro();
+        
+	    //使能秒中断
+	    RTC_ITConfig(RTC_IT_SEC, ENABLE);
+	    //等待操作完成
+	    RTC_WaitForLastTask();
+    }
+
+    #ifdef RTCClockOutput_Enable
+    /* Enable PWR and BKP clocks */
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_PWR | RCC_APB1Periph_BKP, ENABLE);
+    
+    /* Allow access to BKP Domain */
+    PWR_BackupAccessCmd(ENABLE);
+    
+    /* Disable the Tamper Pin */
+    BKP_TamperPinCmd(DISABLE); /* To output RTCCLK/64 on Tamper pin, the tamper
+	  							 functionality must be disabled */
+    
+    /* Enable RTC Clock Output on Tamper Pin */
+    BKP_RTCOutputConfig(BKP_RTCOutputSource_CalibClock);
+    #endif
+}
+
+
+/*******************************************************************************
+* Function Name  : RCC_Configuration
+* Description    : 系统时钟设置
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+void RCC_Configuration(void)
+{
+	ErrorStatus HSEStartUpStatus;
+
+	//使能外部晶振
+	RCC_HSEConfig(RCC_HSE_ON);
+	//等待外部晶振稳定
+	HSEStartUpStatus = RCC_WaitForHSEStartUp();
+	//如果外部晶振启动成功，则进行下一步操作
+	if(HSEStartUpStatus==SUCCESS)
+	{
+		//设置HCLK（AHB时钟）=SYSCLK
+		RCC_HCLKConfig(RCC_SYSCLK_Div1);
+
+		//PCLK1(APB1) = HCLK/2
+		RCC_PCLK1Config(RCC_HCLK_Div2);
+
+		//PCLK2(APB2) = HCLK
+		RCC_PCLK2Config(RCC_HCLK_Div1);
+
+		//FLASH时序控制
+		//推荐值：SYSCLK = 0~24MHz   Latency=0
+		//        SYSCLK = 24~48MHz  Latency=1
+		//        SYSCLK = 48~72MHz  Latency=2
+		FLASH_SetLatency(FLASH_Latency_2);
+		//开启FLASH预取指功能
+		FLASH_PrefetchBufferCmd(FLASH_PrefetchBuffer_Enable);
+
+		//PLL设置 SYSCLK/1 * 9 = 8*1*9 = 72MHz
+		RCC_PLLConfig(RCC_PLLSource_HSE_Div1, RCC_PLLMul_9);
+		//启动PLL
+		RCC_PLLCmd(ENABLE);
+		//等待PLL稳定
+		while(RCC_GetFlagStatus(RCC_FLAG_PLLRDY) == RESET);
+		//系统时钟SYSCLK来自PLL输出
+		RCC_SYSCLKConfig(RCC_SYSCLKSource_PLLCLK);
+		//切换时钟后等待系统时钟稳定
+		while(RCC_GetSYSCLKSource()!=0x08);
+
+
+		/*
+		//设置系统SYSCLK时钟为HSE输入
+		RCC_SYSCLKConfig(RCC_SYSCLKSource_HSE);
+		//等待时钟切换成功
+		while(RCC_GetSYSCLKSource() != 0x04);
+		*/
+	}
+
+	//下面是给各模块开启时钟
+	//启动GPIO
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOC |\
+						   RCC_APB2Periph_GPIOD,\
+						   ENABLE);
+	//启动AFIO
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
+
+}
+
+
+/*******************************************************************************
+* Function Name  : NVIC_Configuration
+* Description    : Configures the nested vectored interrupt controller.
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+void NVIC_Configuration(void)
+{
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+#ifdef  VECT_TAB_RAM
+    /* Set the Vector Table base location at 0x20000000 */
+    NVIC_SetVectorTable(NVIC_VectTab_RAM, 0x0);
+#else  /* VECT_TAB_FLASH  */
+    /* Set the Vector Table base location at 0x08000000 */
+    NVIC_SetVectorTable(NVIC_VectTab_FLASH, 0x0);
+#endif
+    
+    /* Configure one bit for preemption priority */
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_1);
+    
+    /* Enable the RTC Interrupt */
+    NVIC_InitStructure.NVIC_IRQChannel = RTC_IRQChannel;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+}
+
+/*******************************************************************************
+* Function Name  : GPIO_Configuration
+* Description    : Configures the different GPIO ports.
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+void GPIO_Configuration(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+
+    //PC口4567脚设置GPIO输出，推挽 2M
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4 | GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_2MHz;
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+    //KEY2 KEY3 JOYKEY
+    //位于PD口的3 4 11-15脚，使能设置为输入
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3 | GPIO_Pin_4 | GPIO_Pin_11 | GPIO_Pin_12 |\
+        GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOD, &GPIO_InitStructure);
+
+    //USART1_TX
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_9;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+    
+    //USART1_RX
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+}
+
+/*******************************************************************************
+* Function Name  : RTC_Configuration
+* Description    : 来重新配置RTC和BKP，仅在检测到后备寄存器数据丢失时使用
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+void RTC_Configuration(void)
+{
+    //启用PWR和BKP的时钟（from APB1）
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_PWR | RCC_APB1Periph_BKP, ENABLE);
+    
+    //后备域解锁
+    PWR_BackupAccessCmd(ENABLE);
+    
+    //备份寄存器模块复位
+    BKP_DeInit();
+    
+    //外部32.768K其哟偶那个
+    RCC_LSEConfig(RCC_LSE_ON);
+    //等待稳定
+    while (RCC_GetFlagStatus(RCC_FLAG_LSERDY) == RESET);
+    
+    //RTC时钟源配置成LSE（外部32.768K）
+    RCC_RTCCLKConfig(RCC_RTCCLKSource_LSE);
+    
+    //RTC开启
+    RCC_RTCCLKCmd(ENABLE);
+    
+    //开启后需要等待APB1时钟与RTC时钟同步，才能读写寄存器
+    RTC_WaitForSynchro();
+    
+    //读写寄存器前，要确定上一个操作已经结束
+    RTC_WaitForLastTask();
+    
+    //设置RTC分频器，使RTC时钟为1Hz
+    //RTC period = RTCCLK/RTC_PR = (32.768 KHz)/(32767+1)
+    RTC_SetPrescaler(32767);
+
+    
+    //等待寄存器写入完成
+    RTC_WaitForLastTask();
+    
+    //使能秒中断
+    RTC_ITConfig(RTC_IT_SEC, ENABLE);    
+
+    //等待写入完成
+    RTC_WaitForLastTask();
+}
+
+
+/*******************************************************************************
+* Function Name  : Time_Set(u32 t);
+* Description    : 设置当前时间到RTC
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+void Time_Set(u32 t)
+{
+    RTC_WaitForLastTask();
+    RTC_SetCounter(t);
+    RTC_WaitForLastTask();
+}
+
+
+
+/*******************************************************************************
+* Function Name  : USART1_Configuration
+* Description    : NUSART1设置
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+void USART1_Configuration(void)
+{
+    USART_InitTypeDef USART_InitStructure;
+
+    //启动USART1
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);
+	    
+    USART_InitStructure.USART_BaudRate = 115200;
+    USART_InitStructure.USART_WordLength = USART_WordLength_8b;
+    USART_InitStructure.USART_StopBits = USART_StopBits_1;
+    USART_InitStructure.USART_Parity = USART_Parity_No;
+    USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    USART_InitStructure.USART_Mode = USART_Mode_Tx | USART_Mode_Rx;
+    USART_Init(USART1, &USART_InitStructure);
+    
+    //USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+    
+    
+    USART_Cmd(USART1, ENABLE);
+    
+}
+
+/*******************************************************************************
+* Function Name  : int fputc(int ch, FILE *f)
+* Description    : Retargets the C library printf function to the USART.
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+int fputc(int ch, FILE *f)
+{
+    /* Place your implementation of fputc here */
+    /* e.g. write a character to the USART */
+    USART1->DR = (u8)ch;
+    
+    /* Loop until the end of transmission */
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    
+    return ch;
+}
+
